@@ -449,6 +449,19 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return Result{}, err
 	}
 
+	emailFiles := files
+	if len(options.Paths) > 0 {
+		emailFiles, err = gitFiles(ctx, root, nil)
+		if err != nil {
+			return Result{}, err
+		}
+	}
+
+	repoEmails, err := collectExistingAuthorEmails(root, emailFiles)
+	if err != nil {
+		return Result{}, err
+	}
+
 	stdout := options.Stdout
 	if stdout == nil {
 		stdout = io.Discard
@@ -470,7 +483,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			continue
 		}
 
-		metadata, err := historyMetadata(ctx, root, rel, existingAuthorEmails(header))
+		metadata, err := historyMetadata(ctx, root, rel, authorEmailsForFile(repoEmails, header))
 		if err != nil {
 			return result, err
 		}
@@ -520,6 +533,47 @@ type headerBlock struct {
 	end     int
 	newline string
 	text    string
+}
+
+func collectExistingAuthorEmails(root string, files []string) (map[string]string, error) {
+	emails := make(map[string]string)
+
+	for _, rel := range files {
+		abs := filepath.Join(root, filepath.FromSlash(rel))
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", rel, err)
+		}
+
+		header, ok := detectHeader(string(data))
+		if !ok {
+			continue
+		}
+
+		for name, email := range existingAuthorEmails(header) {
+			if _, seen := emails[name]; seen {
+				continue
+			}
+
+			emails[name] = email
+		}
+	}
+
+	return emails, nil
+}
+
+func authorEmailsForFile(repoEmails map[string]string, header headerBlock) map[string]string {
+	emails := make(map[string]string, len(repoEmails))
+
+	for name, email := range repoEmails {
+		emails[name] = email
+	}
+
+	for name, email := range existingAuthorEmails(header) {
+		emails[name] = email
+	}
+
+	return emails
 }
 
 type historyEntry struct {

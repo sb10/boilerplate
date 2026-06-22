@@ -154,6 +154,51 @@ func TestRunUsesGitHistoryPerFile(t *testing.T) {
 	})
 }
 
+func TestRunUsesRepositoryHeaderEmailsForKnownAuthors(t *testing.T) {
+	Convey("Given a Git repo with an author email in another tracked header", t, func() {
+		repo := t.TempDir()
+		runGit(t, repo, nil, "init")
+
+		targetPath := filepath.Join(repo, "target.go")
+		target := goHeader("2020", []Author{{Name: "Alice Example", Email: "alice@target-header.test"}}) +
+			"\npackage demo\n\nconst First = 1\n"
+		So(os.WriteFile(targetPath, []byte(target), 0o600), ShouldBeNil)
+
+		knownPath := filepath.Join(repo, "known.go")
+		known := goHeader("2020", []Author{{Name: "Bob Example", Email: "bob@repo-header.test"}}) +
+			"\npackage demo\n\nconst Known = 1\n"
+		So(os.WriteFile(knownPath, []byte(known), 0o600), ShouldBeNil)
+		commitAll(t, repo, "2020-01-02T03:04:05Z", "Alice Example", "alice@git.test", "initial")
+
+		So(os.WriteFile(targetPath, []byte(target+"\nconst Second = 2\n"), 0o600), ShouldBeNil)
+		commitAll(t, repo, "2021-02-03T04:05:06Z", "Bob Example", "bob@commit.test", "bob change")
+
+		So(os.WriteFile(targetPath, []byte(target+"\nconst Second = 2\nconst Third = 3\n"), 0o600), ShouldBeNil)
+		commitAll(t, repo, "2022-03-04T05:06:07Z", "Carol Example", "carol@commit.test", "carol change")
+
+		Convey("It uses known header emails before falling back to commit emails", func() {
+			stdout := &bytes.Buffer{}
+			result, err := Run(context.Background(), Options{
+				Repo:   repo,
+				Paths:  []string{"target.go"},
+				Write:  true,
+				Stdout: stdout,
+			})
+
+			So(err, ShouldBeNil)
+			So(result.Changed, ShouldResemble, []string{"target.go"})
+			So(stdout.String(), ShouldContainSubstring, "updated: target.go")
+
+			updated, err := os.ReadFile(targetPath)
+			So(err, ShouldBeNil)
+			So(string(updated), ShouldContainSubstring, " * Copyright (c) 2020-2022 Genome Research Ltd.")
+			So(string(updated), ShouldContainSubstring, " * Author: Alice Example <alice@target-header.test>\n * Author: Bob Example <bob@repo-header.test>\n * Author: Carol Example <carol@commit.test>")
+			So(string(updated), ShouldNotContainSubstring, "bob@commit.test")
+			So(string(updated), ShouldNotContainSubstring, "alice@git.test")
+		})
+	})
+}
+
 func lineHeader(prefix string, years string, authors []Author) string {
 	var builder strings.Builder
 	writeHeaderLines(&builder, prefix, years, authors)
