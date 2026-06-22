@@ -91,7 +91,12 @@ func buildHeader(style headerStyle, newline string, metadata Metadata) string {
 	writeCommentLine(&builder, prefix, "", newline)
 
 	for _, author := range metadata.Authors {
-		writeCommentLine(&builder, prefix, "Author: "+author.Name+" <"+author.Email+">", newline)
+		line := "Author: " + author.Name
+		if author.Email != "" {
+			line += " <" + author.Email + ">"
+		}
+
+		writeCommentLine(&builder, prefix, line, newline)
 	}
 
 	writeCommentLine(&builder, prefix, "", newline)
@@ -240,9 +245,75 @@ func parseHistory(output []byte) ([]historyEntry, error) {
 	return entries, nil
 }
 
-func existingAuthorEmails(header headerBlock) map[string]string {
-	emails := make(map[string]string)
+func collectGitAuthors(ctx context.Context, root string) ([]Author, error) {
+	output, err := gitRaw(ctx, root, "log", "--all", "--format=%an%x00%ae")
+	if err != nil {
+		return nil, fmt.Errorf("git authors: %w", err)
+	}
 
+	output = bytes.TrimSpace(output)
+	if len(output) == 0 {
+		return nil, nil
+	}
+
+	lines := bytes.Split(output, []byte("\n"))
+	authors := make([]Author, 0, len(lines))
+
+	for _, line := range lines {
+		parts := bytes.Split(line, []byte{0})
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("unexpected git author record %q", line)
+		}
+
+		name := strings.TrimSpace(string(parts[0]))
+		email := strings.TrimSpace(string(parts[1]))
+		if name == "" {
+			return nil, errors.New("commit author name is empty")
+		}
+
+		authors = append(authors, Author{Name: name, Email: email})
+	}
+
+	return authors, nil
+}
+
+type authorEmailChoice struct {
+	Email string
+	Count int
+}
+
+type authorEmailIndex struct {
+	counts map[string]map[string]int
+}
+
+func newAuthorEmailIndex() authorEmailIndex {
+	return authorEmailIndex{counts: make(map[string]map[string]int)}
+}
+
+func (index *authorEmailIndex) add(author Author) {
+	if author.Email == "" {
+		return
+	}
+
+	if index.counts == nil {
+		index.counts = make(map[string]map[string]int)
+	}
+
+	if index.counts[author.Name] == nil {
+		index.counts[author.Name] = make(map[string]int)
+	}
+
+	index.counts[author.Name][author.Email]++
+}
+
+func (index *authorEmailIndex) addHeader(header headerBlock) {
+	for _, author := range existingAuthors(header) {
+		index.add(author)
+	}
+}
+
+func existingAuthors(header headerBlock) []Author {
+	authors := make([]Author, 0)
 	for _, line := range strings.Split(header.text, header.newline) {
 		payload := commentPayload(header.style, line)
 		match := authorLineRE.FindStringSubmatch(payload)
@@ -251,14 +322,50 @@ func existingAuthorEmails(header headerBlock) map[string]string {
 		}
 
 		author, ok := parseAuthor(match[1])
-		if !ok || author.Email == "" {
+		if !ok {
 			continue
 		}
 
-		emails[author.Name] = author.Email
+		authors = append(authors, author)
 	}
 
-	return emails
+	return authors
+}
+
+func (index authorEmailIndex) bestNonGitHubNoreply(name string) (authorEmailChoice, bool) {
+	counts := index.counts[name]
+	if len(counts) == 0 {
+		return authorEmailChoice{}, false
+	}
+
+	var best authorEmailChoice
+	found := false
+
+	for email, count := range counts {
+		if isGitHubNoreply(email) {
+			continue
+		}
+
+		choice := authorEmailChoice{Email: email, Count: count}
+		if !found || betterEmailChoice(choice, best) {
+			best = choice
+			found = true
+		}
+	}
+
+	return best, found
+}
+
+func isGitHubNoreply(email string) bool {
+	return strings.Contains(strings.ToLower(email), "noreply.github.com")
+}
+
+func betterEmailChoice(candidate authorEmailChoice, current authorEmailChoice) bool {
+	if candidate.Count != current.Count {
+		return candidate.Count > current.Count
+	}
+
+	return candidate.Email < current.Email
 }
 
 // Metadata is the Git-derived data used to rewrite a boilerplate.
@@ -267,7 +374,7 @@ type Metadata struct {
 	Authors []Author
 }
 
-func historyMetadata(ctx context.Context, root string, rel string, existingEmails map[string]string) (Metadata, error) {
+func historyMetadata(ctx context.Context, root string, rel string, emailResolver authorEmailResolver) (Metadata, error) {
 	output, err := gitRaw(ctx, root, "log", "--follow", "--date=format:%Y", "--format=%ad%x00%an%x00%ae", "--", rel)
 	if err != nil {
 		return Metadata{}, fmt.Errorf("git history for %s: %w", rel, err)
@@ -290,11 +397,7 @@ func historyMetadata(ctx context.Context, root string, rel string, existingEmail
 			continue
 		}
 
-		author := entry.Author
-		if email, ok := existingEmails[author.Name]; ok && email != "" {
-			author.Email = email
-		}
-
+		author := emailResolver.resolve(entry.Author)
 		authorsByName[author.Name] = author
 		authorNames = append(authorNames, author.Name)
 	}
@@ -351,6 +454,74 @@ func detectHeader(content string) (headerBlock, bool) {
 	default:
 		return headerBlock{}, false
 	}
+}
+
+type authorEmailResolver struct {
+	repoEmails               authorEmailIndex
+	currentEmails            authorEmailIndex
+	realEmailByGitHubNoreply map[string]authorEmailChoice
+}
+
+func newAuthorEmailResolver(repoEmails authorEmailIndex, gitAuthors []Author) authorEmailResolver {
+	realEmailByGitHubNoreply := make(map[string]authorEmailChoice)
+
+	for _, author := range gitAuthors {
+		if !isGitHubNoreply(author.Email) {
+			continue
+		}
+
+		choice, ok := repoEmails.bestNonGitHubNoreply(author.Name)
+		if !ok {
+			continue
+		}
+
+		key := strings.ToLower(author.Email)
+		current, seen := realEmailByGitHubNoreply[key]
+		if !seen || betterEmailChoice(choice, current) {
+			realEmailByGitHubNoreply[key] = choice
+		}
+	}
+
+	return authorEmailResolver{
+		repoEmails:               repoEmails,
+		realEmailByGitHubNoreply: realEmailByGitHubNoreply,
+	}
+}
+
+func (resolver authorEmailResolver) withCurrentHeader(header headerBlock) authorEmailResolver {
+	currentEmails := newAuthorEmailIndex()
+	currentEmails.addHeader(header)
+	resolver.currentEmails = currentEmails
+
+	return resolver
+}
+
+func (resolver authorEmailResolver) resolve(author Author) Author {
+	if choice, ok := resolver.currentEmails.bestNonGitHubNoreply(author.Name); ok {
+		author.Email = choice.Email
+
+		return author
+	}
+
+	if choice, ok := resolver.repoEmails.bestNonGitHubNoreply(author.Name); ok {
+		author.Email = choice.Email
+
+		return author
+	}
+
+	if !isGitHubNoreply(author.Email) {
+		return author
+	}
+
+	if choice, ok := resolver.realEmailByGitHubNoreply[strings.ToLower(author.Email)]; ok {
+		author.Email = choice.Email
+
+		return author
+	}
+
+	author.Email = ""
+
+	return author
 }
 
 func trimLineEnding(line string) string {
@@ -462,6 +633,13 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		return Result{}, err
 	}
 
+	gitAuthors, err := collectGitAuthors(ctx, root)
+	if err != nil {
+		return Result{}, err
+	}
+
+	emailResolver := newAuthorEmailResolver(repoEmails, gitAuthors)
+
 	stdout := options.Stdout
 	if stdout == nil {
 		stdout = io.Discard
@@ -483,7 +661,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			continue
 		}
 
-		metadata, err := historyMetadata(ctx, root, rel, authorEmailsForFile(repoEmails, header))
+		metadata, err := historyMetadata(ctx, root, rel, emailResolver.withCurrentHeader(header))
 		if err != nil {
 			return result, err
 		}
@@ -535,14 +713,14 @@ type headerBlock struct {
 	text    string
 }
 
-func collectExistingAuthorEmails(root string, files []string) (map[string]string, error) {
-	emails := make(map[string]string)
+func collectExistingAuthorEmails(root string, files []string) (authorEmailIndex, error) {
+	emails := newAuthorEmailIndex()
 
 	for _, rel := range files {
 		abs := filepath.Join(root, filepath.FromSlash(rel))
 		data, err := os.ReadFile(abs)
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", rel, err)
+			return authorEmailIndex{}, fmt.Errorf("read %s: %w", rel, err)
 		}
 
 		header, ok := detectHeader(string(data))
@@ -550,30 +728,10 @@ func collectExistingAuthorEmails(root string, files []string) (map[string]string
 			continue
 		}
 
-		for name, email := range existingAuthorEmails(header) {
-			if _, seen := emails[name]; seen {
-				continue
-			}
-
-			emails[name] = email
-		}
+		emails.addHeader(header)
 	}
 
 	return emails, nil
-}
-
-func authorEmailsForFile(repoEmails map[string]string, header headerBlock) map[string]string {
-	emails := make(map[string]string, len(repoEmails))
-
-	for name, email := range repoEmails {
-		emails[name] = email
-	}
-
-	for name, email := range existingAuthorEmails(header) {
-		emails[name] = email
-	}
-
-	return emails
 }
 
 type historyEntry struct {

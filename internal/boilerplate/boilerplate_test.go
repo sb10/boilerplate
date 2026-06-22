@@ -199,6 +199,88 @@ func TestRunUsesRepositoryHeaderEmailsForKnownAuthors(t *testing.T) {
 	})
 }
 
+func TestRunAvoidsGitHubNoreplyHeaderEmails(t *testing.T) {
+	Convey("Given a Git repo with real and GitHub noreply author identities", t, func() {
+		repo := t.TempDir()
+		runGit(t, repo, nil, "init")
+
+		targetPath := filepath.Join(repo, "target.go")
+		target := goHeader("2020", []Author{
+			{Name: "Current Example", Email: "current@target.test"},
+			{Name: "Nora Example", Email: "333+nora@users.noreply.github.com"},
+		}) + "\npackage demo\n\nconst First = 1\n"
+		So(os.WriteFile(targetPath, []byte(target), 0o600), ShouldBeNil)
+		commitAll(t, repo, "2020-01-02T03:04:05Z", "Current Example", "current@commit.test", "target initial")
+
+		knownFiles := map[string]string{
+			"alias-real.go": goHeader("2020", []Author{{Name: "Real Name", Email: "real@header.test"}}) +
+				"\npackage demo\n\nconst AliasReal = 1\n",
+			"chris-best-a.go": goHeader("2020", []Author{{Name: "Chris Example", Email: "chris@best.test"}}) +
+				"\npackage demo\n\nconst ChrisBestA = 1\n",
+			"chris-best-b.go": goHeader("2020", []Author{{Name: "Chris Example", Email: "chris@best.test"}}) +
+				"\npackage demo\n\nconst ChrisBestB = 1\n",
+			"chris-old.go": goHeader("2020", []Author{{Name: "Chris Example", Email: "chris@old.test"}}) +
+				"\npackage demo\n\nconst ChrisOld = 1\n",
+			"current-repo.go": goHeader("2020", []Author{{Name: "Current Example", Email: "current@repo.test"}}) +
+				"\npackage demo\n\nconst CurrentRepo = 1\n",
+			"nora-real.go": goHeader("2020", []Author{{Name: "Nora Example", Email: "nora@real.test"}}) +
+				"\npackage demo\n\nconst NoraReal = 1\n",
+		}
+
+		for name, content := range knownFiles {
+			So(os.WriteFile(filepath.Join(repo, name), []byte(content), 0o600), ShouldBeNil)
+		}
+
+		commitAll(t, repo, "2020-06-02T03:04:05Z", "Real Name", "111+alias@users.noreply.github.com", "known headers")
+
+		target += "\nconst ChrisChange = 2\n"
+		So(os.WriteFile(targetPath, []byte(target), 0o600), ShouldBeNil)
+		commitAll(t, repo, "2021-01-02T03:04:05Z", "Chris Example", "222+chris@users.noreply.github.com", "chris")
+
+		target += "const NoraChange = 3\n"
+		So(os.WriteFile(targetPath, []byte(target), 0o600), ShouldBeNil)
+		commitAll(t, repo, "2022-01-02T03:04:05Z", "Nora Example", "333+nora@users.noreply.github.com", "nora")
+
+		target += "const AliasChange = 4\n"
+		So(os.WriteFile(targetPath, []byte(target), 0o600), ShouldBeNil)
+		commitAll(t, repo, "2023-01-02T03:04:05Z", "Alias Login", "111+alias@users.noreply.github.com", "alias")
+
+		target += "const NoreplyChange = 5\n"
+		So(os.WriteFile(targetPath, []byte(target), 0o600), ShouldBeNil)
+		commitAll(t, repo, "2024-01-02T03:04:05Z", "Only Noreply", "444+only@users.noreply.github.com", "noreply")
+
+		target += "const FallbackChange = 6\n"
+		So(os.WriteFile(targetPath, []byte(target), 0o600), ShouldBeNil)
+		commitAll(t, repo, "2025-01-02T03:04:05Z", "Fallback Example", "fallback@commit.test", "fallback")
+
+		Convey("It rewrites headers without GitHub noreply email addresses", func() {
+			stdout := &bytes.Buffer{}
+			result, err := Run(context.Background(), Options{
+				Repo:   repo,
+				Paths:  []string{"target.go"},
+				Write:  true,
+				Stdout: stdout,
+			})
+
+			So(err, ShouldBeNil)
+			So(result.Changed, ShouldResemble, []string{"target.go"})
+			So(stdout.String(), ShouldContainSubstring, "updated: target.go")
+
+			updated, err := os.ReadFile(targetPath)
+			So(err, ShouldBeNil)
+			So(string(updated), ShouldContainSubstring, " * Author: Current Example <current@target.test>\n"+
+				" * Author: Chris Example <chris@best.test>\n"+
+				" * Author: Nora Example <nora@real.test>\n"+
+				" * Author: Alias Login <real@header.test>\n"+
+				" * Author: Only Noreply\n"+
+				" * Author: Fallback Example <fallback@commit.test>")
+			So(string(updated), ShouldNotContainSubstring, "noreply.github.com")
+			So(string(updated), ShouldNotContainSubstring, "chris@old.test")
+			So(string(updated), ShouldNotContainSubstring, "current@repo.test")
+		})
+	})
+}
+
 func lineHeader(prefix string, years string, authors []Author) string {
 	var builder strings.Builder
 	writeHeaderLines(&builder, prefix, years, authors)
